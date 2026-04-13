@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonlines
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import tqdm
@@ -56,7 +57,7 @@ from datasets import Dataset, Features, Image
 from huggingface_hub import HfApi, snapshot_download
 from requests import HTTPError
 
-from lerobot.datasets.compute_stats import aggregate_stats
+from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
@@ -72,6 +73,7 @@ from lerobot.datasets.utils import (
     get_file_size_in_mb,
     get_parquet_file_size_in_mb,
     get_parquet_num_frames,
+    INFO_PATH,
     load_info,
     update_chunk_file_indices,
     write_episodes,
@@ -139,8 +141,83 @@ def legacy_load_episodes(local_dir: Path) -> dict:
     return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
 
 
+def _neutral_video_episode_stats(num_frames: int) -> dict[str, np.ndarray]:
+    """Placeholder stats for video (no decode). Matches shapes expected by aggregate_stats validation."""
+    z = np.zeros((3, 1, 1), dtype=np.float64)
+    o = np.ones((3, 1, 1), dtype=np.float64)
+    half = np.full((3, 1, 1), 0.5, dtype=np.float64)
+    return {
+        "min": z,
+        "max": o,
+        "mean": half,
+        "std": o * 0.25,
+        "count": np.array([float(num_frames)], dtype=np.float64),
+        "q01": half.copy(),
+        "q10": half.copy(),
+        "q50": half.copy(),
+        "q90": half.copy(),
+        "q99": half.copy(),
+    }
+
+
+def _series_to_float_array(series: pd.Series) -> np.ndarray:
+    first = series.iloc[0]
+    if isinstance(first, (list, np.ndarray, tuple)):
+        return np.stack([np.asarray(x, dtype=np.float64) for x in series])
+    arr = series.to_numpy()
+    if arr.dtype == object:
+        return np.stack([np.asarray(x, dtype=np.float64) for x in series])
+    if np.issubdtype(arr.dtype, np.bool_):
+        arr = arr.astype(np.float64)
+    return arr
+
+
+def derive_episodes_stats_from_parquet(local_dir: Path) -> dict[int, dict]:
+    """Build per-episode stats when meta/episodes_stats.jsonl is missing (compute from parquet)."""
+    info = load_info(local_dir)
+    features: dict = info["features"]
+    data_dir = local_dir / "data"
+    ep_paths = sorted(data_dir.glob("*/*.parquet"))
+    n_legacy = len(legacy_load_episodes(local_dir))
+    if len(ep_paths) != n_legacy:
+        raise ValueError(
+            f"Episode count mismatch: {len(ep_paths)} parquet files vs {n_legacy} episodes in episodes.jsonl."
+        )
+    out: dict[int, dict] = {}
+    for ep_idx, ep_path in enumerate(
+        tqdm.tqdm(ep_paths, desc="compute episodes stats (missing jsonl)")
+    ):
+        df = pd.read_parquet(ep_path)
+        n_frames = len(df)
+        ep_stats: dict = {}
+        for key, ft in features.items():
+            if ft["dtype"] == "string":
+                continue
+            if ft["dtype"] in ("image", "video"):
+                ep_stats[key] = _neutral_video_episode_stats(n_frames)
+                continue
+            if key not in df.columns:
+                raise ValueError(
+                    f"Missing column {key!r} in {ep_path} while deriving episode stats. "
+                    f"Available: {list(df.columns)}"
+                )
+            arr = _series_to_float_array(df[key])
+            keepdims = arr.ndim == 1
+            ep_stats[key] = get_feature_stats(arr, axis=0, keepdims=keepdims)
+        out[ep_idx] = cast_stats_to_numpy(ep_stats)
+    return out
+
+
 def legacy_load_episodes_stats(local_dir: Path) -> dict:
-    episodes_stats = load_jsonlines(local_dir / LEGACY_EPISODES_STATS_PATH)
+    stats_path = local_dir / LEGACY_EPISODES_STATS_PATH
+    if not stats_path.is_file():
+        logging.warning(
+            "%s not found; deriving per-episode stats from parquet. "
+            "Video features use neutral placeholders.",
+            stats_path,
+        )
+        return derive_episodes_stats_from_parquet(local_dir)
+    episodes_stats = load_jsonlines(stats_path)
     return {
         item["episode_index"]: cast_stats_to_numpy(item["stats"])
         for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
@@ -471,6 +548,15 @@ def convert_dataset(
     use_local_dataset = False
     root = HF_LEROBOT_HOME / repo_id if root is None else Path(root) / repo_id
     if root.exists():
+        info = load_info(root)
+        if info.get("codebase_version") == V30:
+            print(
+                f"Local dataset at {root} is already v3.0 (see {INFO_PATH}). Conversion skipped.\n"
+                "Hub upload failed earlier because this repo_id is not writable; push from Python to a repo you control, e.g.:\n"
+                "  uv run python -c \"from pathlib import Path; from lerobot.datasets.lerobot_dataset import LeRobotDataset; "
+                f"LeRobotDataset(repo_id='YOUR_ORG/your-dataset-v30', root=Path(r'{root}')).push_to_hub()\""
+            )
+            return
         validate_local_dataset_version(root)
         use_local_dataset = True
         print(f"Using local dataset at {root}")
